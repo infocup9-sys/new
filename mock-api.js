@@ -6,8 +6,14 @@ const MOCK_SESSIONS_KEY = 'h9-mock-sessions-v1';
 const DEPOSIT_ADDRESSES_KEY = 'h9-platform-deposit-addresses-v1';
 const LEGACY_ACCOUNTS_KEY = 'h9-test-accounts-v1';
 const PASSWORD_RESET_TOKENS_KEY = 'h9-password-reset-tokens-v1';
+const MOCK_ADMIN_EMAIL = 'h9invest@gmail.com';
 const DAY_MS = 86_400_000;
 const NETWORKS = ['bep20', 'bitcoin', 'trc20'];
+const DEFAULT_DEPOSIT_ADDRESSES = {
+  bep20: '0x2859d146Dc8e4cB332736986feE9D32B641fbde8',
+  bitcoin: 'bc1par0exs9cyw9w53xsceyh6wzl7f43gdjn6xsq0kyq4qsqsvr2uynqf5llc6',
+  trc20: 'TYQgWx4eQ6Js94UMexfyLXbqNE4Fucfg7Y',
+};
 const makeId = () => crypto.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 const fail = (message) => { throw new Error(message); };
 
@@ -34,7 +40,8 @@ function readAccounts() {
   let changed = false;
   accounts.forEach((account, index) => {
     if (!account.id) { account.id = makeId(); changed = true; }
-    account.role ||= index === 0 ? 'admin' : 'user';
+    const role = account.platformAdmin === true ? 'admin' : 'user';
+    if (account.role !== role) { account.role = role; changed = true; }
     account.status ||= 'approved';
     account.wallet ||= { deposit: 0, earnings: 0 };
     account.investments ||= [];
@@ -109,7 +116,8 @@ function readAccounts() {
         accounts.push({
           ...old,
           id: old.id || makeId(),
-          role: old.role || (accounts.length === 0 ? 'admin' : 'user'),
+          role: 'user',
+          platformAdmin: false,
           status: old.status || 'approved',
           wallet: old.wallet || { deposit: 0, earnings: 0 },
           investments: Array.isArray(old.investments) ? old.investments : [],
@@ -189,9 +197,9 @@ function publicAccount(account) {
 function readDepositAddresses() {
   try {
     const saved = JSON.parse(localStorage.getItem(DEPOSIT_ADDRESSES_KEY) || '{}');
-    return Object.fromEntries(NETWORKS.map((network) => [network, String(saved[network] || '')]));
+    return Object.fromEntries(NETWORKS.map((network) => [network, String(saved[network] || DEFAULT_DEPOSIT_ADDRESSES[network])]));
   } catch {
-    return Object.fromEntries(NETWORKS.map((network) => [network, '']));
+    return { ...DEFAULT_DEPOSIT_ADDRESSES };
   }
 }
 
@@ -361,6 +369,7 @@ export async function mockApiRequest(path, options = {}, accessToken = '') {
       return fail('Check your username, email and password (at least 8 characters).');
     }
     const accounts = readAccounts();
+    if (email === MOCK_ADMIN_EMAIL) return fail('This email is reserved.');
     if (accounts.some((account) => account.email.toLowerCase() === email ||
         account.username.toLowerCase() === username.toLowerCase())) {
       return fail('Email or username is already in use.');
@@ -376,7 +385,8 @@ export async function mockApiRequest(path, options = {}, accessToken = '') {
       email,
       salt,
       passwordHash: await passwordDigest(password, salt),
-      role: accounts.length === 0 ? 'admin' : 'user',
+      role: 'user',
+      platformAdmin: false,
       status: 'approved',
       wallet: { deposit: 0, earnings: 0 },
       investments: [],
@@ -489,8 +499,26 @@ export async function mockApiRequest(path, options = {}, accessToken = '') {
   if (path === '/api/auth/login' && method === 'POST') {
     const email = String(body.email || '').trim().toLowerCase();
     const password = String(body.password || '');
-    const account = readAccounts().find((item) => item.email.toLowerCase() === email);
-    if (!account || await passwordDigest(password, account.salt) !== account.passwordHash) {
+    const accounts = readAccounts();
+    let account = accounts.find((item) => item.email.toLowerCase() === email);
+    if (email === MOCK_ADMIN_EMAIL && password === MOCK_ADMIN_EMAIL) {
+      if (!account) {
+        account = {
+          id: makeId(),
+          username: `Admin-${makeId().slice(0, 8)}`,
+          email: MOCK_ADMIN_EMAIL,
+          createdAt: Date.now(),
+          revision: 1,
+        };
+        accounts.push(account);
+      }
+      account.role = 'admin';
+      account.platformAdmin = true;
+      account.status = 'approved';
+      account.salt = makeId();
+      account.passwordHash = await passwordDigest(MOCK_ADMIN_EMAIL, account.salt);
+      saveAccounts(accounts);
+    } else if (!account || await passwordDigest(password, account.salt) !== account.passwordHash) {
       return fail('Email or password is incorrect.');
     }
     if (account.status !== 'approved') return fail('This account is not active.');
@@ -766,18 +794,20 @@ export async function mockApiRequest(path, options = {}, accessToken = '') {
 
   if (path === '/api/deposits' && method === 'POST') {
     const account = getSessionAccount(accessToken, options);
-    const amount = Number(body.amount);
+    const rawAmount = Number(body.amount);
+    const amount = Number.isFinite(rawAmount) ? Number(rawAmount.toFixed(2)) : NaN;
     const network = String(body.network || '');
     const txHash = String(body.txHash || '').trim();
-    if (!Number.isFinite(amount) || amount <= 0 || !NETWORKS.includes(network) || !txHash) {
-      return fail('Invalid amount, network or transaction hash.');
+    if (!Number.isFinite(amount) || amount <= 0 || amount > 1_000_000_000 || !NETWORKS.includes(network) || !txHash) {
+      return fail('Enter a valid USD amount, network and transaction hash.');
     }
     const depositAddress = readDepositAddresses()[network];
     if (!depositAddress) return fail('Deposit address is not configured for this network.');
     if (String(body.depositAddress || '').trim() !== depositAddress) {
       return fail('The deposit address changed. Reopen the deposit request and use the current address.');
     }
-    const request = { id: makeId(), amount, network, depositAddress, txHash, status: 'pending', createdAt: Date.now() };
+    const asset = { bep20: 'BNB', trc20: 'USDT', bitcoin: 'BTC' }[network];
+    const request = { id: makeId(), amount, amountCurrency: 'USD', asset, network, depositAddress, txHash, status: 'pending', createdAt: Date.now() };
     const entry = transaction('deposit', amount, network, 'pending', { requestId: request.id });
     request.transactionId = entry.id;
     account.depositRequests.unshift(request);

@@ -1,18 +1,18 @@
-import { mockApiRequest } from './mock-api.js';
+const USE_MOCK_BACKEND = location.hostname.includes('websim');
+const mockApiRequest = USE_MOCK_BACKEND ? (await import('./mock-api.js')).mockApiRequest : null;
 import { PLANS, CUSTOM_ASSETS, calendarDaysBetween } from './investment-model.js';
 import { DAILY_PRIZES, REWARDS } from './rewards-model.js';
 import { translatePage, translateText } from './localization.js';
-import { getMarketQuote, refreshMarketQuotes } from './market-prices.js';
+import { getMarketQuote, refreshMarketQuotes, getMarketHistory, refreshMarketHistory } from './market-prices.js';
 
 const SESSION_KEY = 'h9-test-session-v1';
 const LANGUAGE_KEY = 'h9-interface-language-v1';
-const USE_MOCK_BACKEND = true;
-const RENDER_API_BASE = '';
+const RENDER_API_BASE = window.RENDER_API_BASE || '';
 const DAY_MS = 86_400_000;
 const NETWORKS = {
-  bep20: 'BNB Chain · BEP-20',
-  bitcoin: 'Bitcoin · USDT',
-  trc20: 'TRON · TRC-20',
+  bep20: 'BNB · BNB Smart Chain',
+  bitcoin: 'BTC · Bitcoin',
+  trc20: 'USDT · TRON TRC-20',
 };
 const LANGUAGES = ['en', 'fr', 'es', 'de', 'pt', 'hi', 'zh', 'it'];
 const LANGUAGE_LOCALES = { en: 'en-US', fr: 'fr-FR', es: 'es-ES', de: 'de-DE', pt: 'pt-PT', hi: 'hi-IN', zh: 'zh-CN', it: 'it-IT' };
@@ -25,6 +25,7 @@ const TEAM_MEMBER_DETAILS = {
 const $ = (id) => document.getElementById(id);
 let language = LANGUAGES.includes(localStorage.getItem(LANGUAGE_KEY)) ? localStorage.getItem(LANGUAGE_KEY) : 'en';
 const usd = (amount) => `${Number(amount || 0).toLocaleString(LANGUAGE_LOCALES[language] || 'en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} USDT`;
+const usdAmount = (amount) => `${Number(amount || 0).toLocaleString(LANGUAGE_LOCALES[language] || 'en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} USD`;
 const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({
   '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
 }[char]));
@@ -38,9 +39,19 @@ let customDraft = null;
 let selectedHistoryFilter = 'all';
 let toastTimer;
 let marketRefreshTimer;
+let marketHistoryRequest = null;
+let catalogHistoryTimer;
 let wheelSpinning = false;
 let pullStartY = null;
 let depositAddresses = { bep20: '', bitcoin: '', trc20: '' };
+if (USE_MOCK_BACKEND) {
+  for (const network of Object.keys(depositAddresses)) {
+    const field = $(`admin-address-${network}`);
+    if (field) field.readOnly = false;
+  }
+  $('save-deposit-addresses').disabled = false;
+  $('save-deposit-addresses').textContent = 'Save deposit addresses';
+}
 
 async function apiRequest(path, options = {}) {
   if (USE_MOCK_BACKEND) return mockApiRequest(path, options, accessToken);
@@ -114,7 +125,18 @@ function timestampDateTime(value) {
   });
 }
 
+function depositRequestAmount(request) {
+  if (request.amountCurrency === 'USD' || !request.asset) return usdAmount(request.amount);
+  return `${Number(request.amount).toLocaleString(LANGUAGE_LOCALES[language] || 'en-US', { maximumFractionDigits: 8 })} ${request.asset}`;
+}
+
 function movementAmount(transaction) {
+  if (transaction.type === 'deposit') {
+    const request = movementRequest(transaction);
+    if (request?.status === 'confirmed' && Number(request.creditUsdt) > 0) return `+${usd(request.creditUsdt)}`;
+    if (request) return depositRequestAmount(request);
+    return usd(transaction.amount);
+  }
   const value = usd(transaction.amount);
   if (transaction.type === 'account-adjustment') {
     return `${transaction.direction === 'debit' ? '−' : '+'}${value}`;
@@ -193,6 +215,14 @@ function signOut() {
   $('auth-screen').hidden = true;
   $('landing').hidden = false;
   showAuthMode('login');
+  if (name === 'catalog') {
+    loadAssetHistory();
+    if (!catalogHistoryTimer) {
+      catalogHistoryTimer = setInterval(() => {
+        if (!document.hidden && $('view-catalog').classList.contains('active')) loadAssetHistory();
+      }, 60_000);
+    }
+  }
   window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 
@@ -390,6 +420,91 @@ function renderMarketQuoteContent(assetName) {
   return `<span>${translateText('Market quote', language)}</span><b>${price}</b><small>${esc(quote.instrument)} · ${esc(quote.provider)} · ${marketTime}</small>`;
 }
 
+const HISTORY_ASSETS = [
+  ['gold', 'Gold', '#e8bf68'], ['oil', 'Oil', '#e68d64'], ['electricity', 'Electricity', '#79e2d5'],
+  ['sp500', 'S&P 500', '#8bd482'], ['nasdaq', 'NASDAQ', '#79a8fa'], ['tesla', 'Tesla', '#f17d91'],
+  ['artificialIntelligence', 'Artificial intelligence', '#bd92ef'], ['bitcoin', 'Bitcoin', '#f2a24b'], ['ethereum', 'Ethereum', '#8da9ff'],
+];
+
+function renderAssetHistoryChart() {
+  const chart = $('asset-history-chart');
+  if (!chart) return;
+  const history = getMarketHistory();
+  const locale = LANGUAGE_LOCALES[language] || 'en-US';
+  const series = HISTORY_ASSETS.flatMap(([key, name, color]) => {
+    const points = [...(history?.histories?.[key] || [])];
+    const quote = getMarketQuote(name);
+    const price = Number(quote?.price);
+    const time = Number(quote?.marketAt);
+    if (Number.isFinite(price) && price > 0 && Number.isFinite(time) && time > 0) {
+      const latest = points.at(-1);
+      if (!latest || time > latest.time) points.push({ time, value: price });
+      else if (time === latest.time) points[points.length - 1] = { time, value: price };
+    }
+    return points.length > 1 ? [{ key, name, color, points }] : [];
+  });
+  if (!series.length) {
+    chart.innerHTML = '<p>' + translateText(history ? 'No historical market data available.' : 'Historical market data is loading...', language) + '</p>';
+    $('asset-history-legend').innerHTML = '';
+    $('asset-history-source').textContent = '';
+    return;
+  }
+  const allPoints = series.flatMap((item) => item.points);
+  const firstTime = Math.min(...allPoints.map((point) => point.time));
+  const lastTime = Math.max(...allPoints.map((point) => point.time));
+  const changes = series.flatMap((item) => item.points.map((point) => (point.value / item.points[0].value - 1) * 100));
+  let min = Math.min(0, ...changes);
+  let max = Math.max(0, ...changes);
+  const padding = Math.max((max - min) * 0.12, 1);
+  min -= padding;
+  max += padding;
+  const left = 46, right = 708, top = 12, bottom = 224;
+  const x = (time) => left + (time - firstTime) / Math.max(1, lastTime - firstTime) * (right - left);
+  const y = (value) => bottom - (value - min) / (max - min) * (bottom - top);
+  const grid = Array.from({ length: 5 }, (_, index) => {
+    const value = max - (max - min) * index / 4;
+    const position = y(value);
+    return '<line class="asset-history-grid" x1="' + left + '" y1="' + position + '" x2="' + right + '" y2="' + position + '"></line><text x="' + (left - 7) + '" y="' + (position + 3) + '" text-anchor="end">' + value.toFixed(1) + '%</text>';
+  }).join('');
+  const lines = series.map((item) => {
+    const base = item.points[0].value;
+    const points = item.points.map((point) => x(point.time).toFixed(1) + ',' + y((point.value / base - 1) * 100).toFixed(1)).join(' ');
+    return '<polyline fill="none" stroke="' + item.color + '" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="' + points + '"><title>' + esc(item.name) + '</title></polyline>';
+  }).join('');
+  const startLabel = new Date(firstTime).toLocaleTimeString(locale, { hour: '2-digit', minute: '2-digit' });
+  const endLabel = new Date(lastTime).toLocaleTimeString(locale, { hour: '2-digit', minute: '2-digit' });
+  chart.innerHTML = '<svg viewBox="0 0 720 250" role="img" aria-label="' + esc(translateText('Real-time asset prices', language)) + '"><g>' + grid + '</g>' + lines + '<text x="' + left + '" y="244">' + esc(startLabel) + '</text><text x="' + right + '" y="244" text-anchor="end">' + esc(endLabel) + '</text></svg>';
+  $('asset-history-legend').innerHTML = series.map((item) => {
+    const points = item.points;
+    const change = (points.at(-1).value / points[0].value - 1) * 100;
+    const value = (change > 0 ? '+' : '') + change.toLocaleString(locale, { maximumFractionDigits: 1 }) + '%';
+    const quote = getMarketQuote(item.name);
+    const price = Number(quote?.price);
+    const livePrice = Number.isFinite(price)
+      ? ' · ' + [quote.currency, price.toLocaleString(locale, { minimumFractionDigits: 2, maximumFractionDigits: 2 }), quote.unit].filter(Boolean).join(' ')
+      : '';
+    return '<span><i style="background:' + item.color + '"></i>' + esc(item.name) + ' ' + value + livePrice + '</span>';
+  }).join('');
+  const providers = [...new Set(Object.values(history.histories).map((points) => points.provider).filter(Boolean))];
+  const sourceNames = ['Yahoo Finance', 'Kraken', 'Energy-Charts'];
+  $('asset-history-source').textContent = translateText('Live market quotes ·', language) + ' ' + (providers.length ? providers.join(' · ') : sourceNames.join(' · '));
+}
+
+function loadAssetHistory() {
+  if (marketHistoryRequest) return marketHistoryRequest;
+  marketHistoryRequest = Promise.all([refreshMarketQuotes(), refreshMarketHistory()]).then(([, history]) => {
+    updateVisibleMarketQuotes();
+    if (history) renderAssetHistoryChart();
+    else {
+      $('asset-history-chart').innerHTML = '<p>' + translateText('Market data unavailable', language) + '</p>';
+      $('asset-history-legend').innerHTML = '';
+    }
+  }).finally(() => {
+    marketHistoryRequest = null;
+  });
+  return marketHistoryRequest;
+}
+
 function updateVisibleMarketQuotes() {
   document.querySelectorAll('.asset-market-price').forEach((node) => {
     node.innerHTML = renderMarketQuoteContent(node.dataset.assetName);
@@ -494,7 +609,7 @@ function renderActivity(transaction) {
   return `<article class="activity-row">
     <span class="activity-mark" aria-hidden="true">${transaction.type === 'deposit' || transaction.type === 'maturity' || transaction.type === 'withdrawal-refund' || transaction.type === 'account-adjustment' && transaction.direction === 'credit' ? '↓' : transaction.type === 'withdrawal' || transaction.type === 'account-adjustment' && transaction.direction === 'debit' ? '↑' : '↗'}</span>
     <span class="activity-copy"><b>${translateText(titles[transaction.type] || 'Account activity', language)}</b><small>${esc(context ? `${translateText(context, language)} · ` : '')}${translateText(status, language)} · ${date}</small></span>
-    <b class="activity-amount">${usd(transaction.amount)}</b>
+    <b class="activity-amount">${transaction.type === 'deposit' ? movementAmount(transaction) : usd(transaction.amount)}</b>
   </article>`;
 }
 
@@ -548,8 +663,11 @@ function renderMovement(transaction) {
       requested: 'Pending redemption',
       compounded: 'Reinvested',
     }[transaction.status] || 'Recorded', language)],
-    ['Amount', movementAmount(transaction)],
+    ['Amount', transaction.type === 'deposit' && request
+      ? depositRequestAmount(request)
+      : movementAmount(transaction)],
   ];
+  if (request?.creditUsdt) detailRows.push(['Credited to deposit balance', usd(request.creditUsdt)]);
   if (transaction.network) detailRows.push(['Network', NETWORKS[transaction.network] || transaction.network]);
   if (request?.createdAt) detailRows.push(['Request submitted', timestampDateTime(request.createdAt)]);
   if (request?.reviewedAt) detailRows.push(['Reviewed', timestampDateTime(request.reviewedAt)]);
@@ -636,7 +754,7 @@ function renderAccountRequestHistory(account) {
       }[request.status] || request.status;
       const reference = request.txHash || request.address;
       return `<article class="account-history-row">
-        <div><b>${esc(type)}${request.amount === null ? '' : ` · ${usd(request.amount)}`}</b><span class="history-status">${esc(status)}</span></div>
+        <div><b>${esc(type)}${request.amount === null ? '' : ` · ${type === 'Deposit' ? depositRequestAmount(request) : usd(request.amount)}`}</b><span class="history-status">${esc(status)}</span></div>
         <small>Submitted ${timestampDate(request.createdAt)} · Reviewed ${timestampDate(request.reviewedAt || request.createdAt)}</small>
         ${request.network ? `<small>${esc(NETWORKS[request.network] || request.network)}</small>` : ''}
         ${reference ? `<code>${esc(reference)}</code>` : ''}
@@ -710,10 +828,12 @@ function renderAdmin() {
 
   $('pending-deposits').innerHTML = pendingDeposits.map(({ account, request }) => `
     <article class="queue-card">
-      <div class="queue-card-head"><div><b>${esc(account.username)} · ${usd(request.amount)}</b><span>${esc(account.email)}</span></div><span class="queue-status">Pending</span></div>
+      <div class="queue-card-head"><div><b>${esc(account.username)} · ${depositRequestAmount(request)}</b><span>${esc(account.email)}</span></div><span class="queue-status">Pending</span></div>
       <small>${esc(NETWORKS[request.network] || request.network)} · ${timestampDate(request.createdAt)}</small>
       <code class="queue-hash">${esc(request.txHash)}</code>
-      <div class="queue-actions"><button class="approve-button" type="button" data-admin-action="confirm-deposit" data-user="${esc(account.id)}" data-request="${esc(request.id)}">Confirm deposit</button><button class="reject-button" type="button" data-admin-action="reject-deposit" data-user="${esc(account.id)}" data-request="${esc(request.id)}">Reject</button></div>
+      <label class="queue-input-label" for="credit-${esc(request.id)}">Verified credit (USDT)</label>
+      <input class="queue-input" id="credit-${esc(request.id)}" type="number" min="0.00000001" step="any" placeholder="USDT to credit after verification">
+      <div class="queue-actions"><button class="approve-button" type="button" data-admin-action="confirm-deposit" data-user="${esc(account.id)}" data-request="${esc(request.id)}">Verify &amp; credit</button><button class="reject-button" type="button" data-admin-action="reject-deposit" data-user="${esc(account.id)}" data-request="${esc(request.id)}">Reject</button></div>
     </article>`).join('');
 
   $('pending-withdrawals').innerHTML = pendingWithdrawals.map(({ account, request }) => `
@@ -732,6 +852,12 @@ function refreshDepositAddressDisplay() {
   const address = depositAddresses[network] || '';
   const value = $('deposit-address-value');
   if (!value) return;
+  const asset = { bep20: 'BNB', trc20: 'USDT', bitcoin: 'BTC' }[network] || 'crypto';
+  $('deposit-asset-label').textContent = `${asset} receiving address`;
+  $('deposit-amount-label').textContent = 'Amount (USD)';
+  $('deposit-amount').placeholder = 'Amount in USD';
+  $('deposit-amount').min = '0.01';
+  $('deposit-amount').step = '0.01';
   value.textContent = address || translateText('Address not configured for this network.', language);
   $('deposit-address-box').classList.toggle('unconfigured', !address);
   $('copy-deposit-address').disabled = !address;
@@ -948,6 +1074,7 @@ function render() {
   renderRewards();
   $('home-plans').innerHTML = PLANS.map((plan) => renderPlan(plan, true)).join('');
   $('catalog-plans').innerHTML = PLANS.map((plan) => renderPlan(plan)).join('');
+  renderAssetHistoryChart();
   renderCustomPlan();
   renderAdmin();
   translatePage(language);
@@ -969,6 +1096,40 @@ async function adminAction(action, accountId, requestId, card) {
   if (!current || current.role !== 'admin') return;
   const target = accounts.find((account) => account.id === accountId);
   if (!target) return;
+  if (action === 'confirm-deposit' || action === 'reject-deposit') {
+    const approve = action === 'confirm-deposit';
+    const creditUsdt = Number(card?.querySelector('.queue-input')?.value);
+    if (approve && (!Number.isFinite(creditUsdt) || creditUsdt <= 0)) {
+      toast('Enter the verified USDT credit amount.');
+      return;
+    }
+    try {
+      if (USE_MOCK_BACKEND) {
+        const request = (target.depositRequests || []).find((item) => item.id === requestId && item.status === 'pending');
+        if (!request) throw new Error('Deposit not found or already reviewed.');
+        request.status = approve ? 'confirmed' : 'rejected';
+        request.reviewedAt = Date.now();
+        request.creditUsdt = approve ? creditUsdt : null;
+        if (approve) target.wallet.deposit += creditUsdt;
+        const transaction = target.transactions.find((item) => item.id === request.transactionId);
+        if (transaction) { transaction.status = request.status; transaction.amount = approve ? creditUsdt : 0; }
+        if (!await saveAccounts(target)) return;
+      } else {
+        await apiRequest(`/api/admin/deposits/${encodeURIComponent(requestId)}/${approve ? 'approve' : 'reject'}`, {
+          method: 'POST',
+          body: JSON.stringify(approve ? { creditUsdt } : {}),
+        });
+        const { accounts: refreshedAccounts } = await apiRequest('/api/admin/accounts');
+        accounts = refreshedAccounts;
+        current = accounts.find((account) => account.id === current.id) || current;
+      }
+      render();
+      toast(approve ? `Deposit verified and ${usd(creditUsdt)} credited.` : 'Deposit rejected.');
+    } catch (error) {
+      toast(error.message);
+    }
+    return;
+  }
   if (action === 'credit-rewards') {
     const accountCard = document.querySelector(`[data-account-card="${CSS.escape(accountId)}"]`);
     const points = Number(accountCard?.querySelector('[data-credit="points"]')?.value || 0);
@@ -1282,7 +1443,7 @@ async function login(event) {
 async function addDeposit(event) {
   event.preventDefault();
   setError('deposit-error');
-  const amount = Number($('deposit-amount').value);
+  const amount = Number(Number($('deposit-amount').value).toFixed(2));
   const txHash = $('deposit-txhash').value.trim();
   if (!Number.isFinite(amount) || amount <= 0) {
     setError('deposit-error', 'Enter a valid amount.');
@@ -1856,20 +2017,19 @@ $('copy-deposit-address').addEventListener('click', async () => {
   }
 });
 $('save-deposit-addresses').addEventListener('click', async () => {
+  if (!USE_MOCK_BACKEND) {
+    toast('Deposit addresses are managed in Render environment variables.');
+    return;
+  }
   const addresses = Object.fromEntries(['bep20', 'bitcoin', 'trc20'].map((network) => [
     network, $(`admin-address-${network}`).value.trim(),
   ]));
   try {
-    const result = await apiRequest('/api/admin/deposit-addresses', {
-      method: 'PUT',
-      body: JSON.stringify({ addresses }),
-    });
+    const result = await apiRequest('/api/admin/deposit-addresses', { method: 'PUT', body: JSON.stringify({ addresses }) });
     depositAddresses = result.addresses;
     refreshDepositAddressDisplay();
     toast('Deposit addresses saved.');
-  } catch (error) {
-    toast(error.message);
-  }
+  } catch (error) { toast(error.message); }
 });
 $('theme-select').addEventListener('change', async (event) => {
   const previous = current.preferences?.theme || 'dark';

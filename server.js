@@ -10,6 +10,9 @@ const yahooInstruments = {
 let cachedQuotes = null;
 let cachedAt = 0;
 let refreshInFlight = null;
+let cachedHistory = null;
+let historyAt = 0;
+let historyInFlight = null;
 
 async function fetchJson(url, yahooRequest = false) {
   const controller = new AbortController();
@@ -94,6 +97,67 @@ async function electricityQuote(now) {
   };
 }
 
+
+async function yahooHistory(asset) {
+  const body = await fetchJson(
+    "https://query2.finance.yahoo.com/v8/finance/chart/" + encodeURIComponent(asset.symbol) + "?range=1d&interval=1m",
+    true,
+  );
+  const result = body?.chart?.result?.[0];
+  const timestamps = result?.timestamp || [];
+  const closes = result?.indicators?.quote?.[0]?.close || [];
+  const points = timestamps.flatMap((timestamp, index) => {
+    const value = Number(closes[index]);
+    return Number.isFinite(value) && value > 0
+      ? [{ time: Number(timestamp) * 1000, value }]
+      : [];
+  });
+  return points.filter((point, index) => index % 15 === 0 || index === points.length - 1);
+}
+
+function electricityHistory(body, since) {
+  return (body?.unix_seconds || []).flatMap((seconds, index) => {
+    const time = Number(seconds) * 1000;
+    const value = Number(body.price[index]);
+    return Number.isFinite(time) && time >= since * 1000 && Number.isFinite(value)
+      ? [{ time, value }]
+      : [];
+  });
+}
+
+async function loadAssetHistory() {
+  const now = Date.now();
+  const since = Math.floor((now - 24 * 60 * 60 * 1000) / 1000);
+  const electricityParams = new URLSearchParams({
+    bzn: "DE-LU",
+    start: new Date(now - 72 * 60 * 60 * 1000).toISOString(),
+    end: new Date(now).toISOString(),
+  });
+  const [yahooEntries, bitcoinBody, ethereumBody, bitcoinYahoo, ethereumYahoo, electricityBody] = await Promise.all([
+    Promise.all(Object.entries(yahooInstruments).map(async ([key, asset]) => [key, await yahooHistory(asset)])),
+    fetchJson("https://api.kraken.com/0/public/OHLC?pair=XBTUSD&interval=30&since=" + since),
+    fetchJson("https://api.kraken.com/0/public/OHLC?pair=ETHUSD&interval=30&since=" + since),
+    yahooHistory({ symbol: "BTC-USD" }),
+    yahooHistory({ symbol: "ETH-USD" }),
+    fetchJson("https://api.energy-charts.info/price?" + electricityParams),
+  ]);
+  const histories = Object.fromEntries(yahooEntries.filter(([, points]) => points.length));
+  for (const [key, body, fallback] of [["bitcoin", bitcoinBody, bitcoinYahoo], ["ethereum", ethereumBody, ethereumYahoo]]) {
+    const result = body?.result || {};
+    const ticker = Object.keys(result).find((name) => name !== "last");
+    const points = (ticker ? result[ticker] : []).flatMap((row) => {
+      const value = Number(row[4]);
+      return Number.isFinite(value) && value > 0 ? [{ time: Number(row[0]) * 1000, value }] : [];
+    });
+    const fallbackPoints = fallback.filter((point) => Number.isFinite(point.value) && point.value > 0);
+    if (points.length) histories[key] = points;
+    else if (fallbackPoints.length) histories[key] = fallbackPoints;
+  }
+  const electricity = electricityHistory(electricityBody, since);
+  if (electricity.length) histories.electricity = electricity;
+  return { histories, fetchedAt: Date.now() };
+}
+
 async function loadQuotes() {
   const now = Date.now();
   const [entries, crypto, electricity] = await Promise.all([
@@ -110,9 +174,21 @@ async function loadQuotes() {
 export default {
   async fetch(request) {
     const url = new URL(request.url);
-    if (request.method !== "GET" || url.pathname !== "/api/asset-prices") {
-      return new Response("Not found", { status: 404 });
+    if (request.method !== "GET") return new Response("Not found", { status: 404 });
+    if (url.pathname === "/api/asset-history") {
+      if (cachedHistory && Date.now() - historyAt < 20_000) {
+        return Response.json(cachedHistory, { headers: { "Cache-Control": "no-store" } });
+      }
+      if (!historyInFlight) {
+        historyInFlight = loadAssetHistory().then((data) => {
+          cachedHistory = data;
+          historyAt = Date.now();
+          return cachedHistory;
+        }).finally(() => { historyInFlight = null; });
+      }
+      return Response.json(await historyInFlight, { headers: { "Cache-Control": "no-store" } });
     }
+    if (url.pathname !== "/api/asset-prices") return new Response("Not found", { status: 404 });
     if (cachedQuotes && Date.now() - cachedAt < 60_000) {
       return Response.json(cachedQuotes, { headers: { "Cache-Control": "no-store" } });
     }

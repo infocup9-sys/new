@@ -1,10 +1,12 @@
 # API per Render
 
+> Il backend di deposito Render esportabile è in `render-backend/`. La configurazione di produzione usa PostgreSQL, password scrypt, sessioni server-side e revisione manuale dei depositi. Le note storiche sotto descrivono il mock esistente e il vecchio contratto: non configurare il vecchio `server.js` Render per accettare fondi. Seguire `render-backend/README.md` per il bundle nuovo e i limiti delle API non ancora migrate.
+
 ## Modalità attuale
 
-L'app usa `mock-api.js` come backend locale nel browser. `script.js` seleziona questo adattatore con `USE_MOCK_BACKEND = true`; gli account e i relativi dati persistono in `localStorage` per questo browser e non vengono eliminati al refresh. Il token di accesso resta in `sessionStorage`, separato per scheda, e il logout invalida solo la sessione corrente senza cancellare l'account o i suoi dati. Ogni sessione utente può leggere e aggiornare solo l'account associato al proprio token. Le funzioni di amministrazione esistenti restano disponibili alle sessioni con ruolo admin, secondo le rotte `/api/admin/*`. Il recupero password locale usa una chiave casuale di 192 bit assegnata dall'amministratore a un account registrato tramite email. La chiave viene mostrata una sola volta e salvata solo come hash. L'amministratore può copiare un link con email e chiave nel frammento URL `#recover?...`; il frammento non viene inviato al server e viene rimosso dall'indirizzo all'apertura della pagina. L'utente può così arrivare direttamente al form precompilato. In alternativa, il pulsante di supporto apre una bozza mailto, che l'utente deve inviare manualmente. L'assegnazione, gli account e il reset sono limitati al browser che contiene i dati locali; non si sincronizzano tra browser o dispositivi e non offrono verifica email lato server. L'adattatore riproduce le rotte HTTP previste.
+Il preview Websim usa `mock-api.js` solo per la dimostrazione locale. Il deploy Render usa `render-backend/server.js` e PostgreSQL; autenticazione, sessioni e depositi non fanno fallback a localStorage. Il backend Render è un primo rilascio limitato al login/registrazione, lettura account e flusso deposito con revisione admin. Le altre funzioni applicative indicate nel contratto storico qui sotto non sono ancora migrate e rispondono 501 in produzione; non usarle per operazioni finanziarie finché non sono state implementate lato server.
 
-Per collegare Render, impostare `USE_MOCK_BACKEND = false` e inserire l'origine HTTPS del servizio in `RENDER_API_BASE`. Il servizio Render dovrà consentire CORS per l'origine del frontend.
+Per Render, impostare il comando di avvio a `node render-backend/server.js` così il backend serve anche i file statici con API same-origin. Nel preview Websim il mock resta attivo esclusivamente per la demo. La modalità Render non carica l'adattatore mock.
 
 ## Contratto richiesto al servizio
 
@@ -25,7 +27,7 @@ Per collegare Render, impostare `USE_MOCK_BACKEND = false` e inserire l'origine 
 - `PUT /api/admin/account` — aggiornamento amministrativo di un altro account, con `revision`; solo per amministratore.
 - `POST /api/admin/rewards/credit` — `{ accountId, points, spins }`; accredita punti H9 e giri bonus a un account, solo per amministratore.
 - `DELETE /api/admin/accounts` — elimina gli account locali, solo per amministratore e su azione esplicita; non è l'operazione di logout.
-- `POST /api/deposits` — `{ amount, network, depositAddress, txHash }`; il servizio controlla che l’indirizzo corrisponda a quello corrente per la rete e registra la richiesta in revisione.
+- `POST /api/deposits` — `{ amount, network, depositAddress, txHash }`; `amount` è espresso in USD e arrotondato ai centesimi. Il servizio controlla che l’indirizzo corrisponda a quello corrente per la rete e registra la richiesta in revisione; l’importo accreditato è inserito dall’admin dopo la verifica manuale.
 - `POST /api/withdrawals` — `{ amount, network, address, pin }`; il server verifica wallet collegato, PIN e saldo e riserva il saldo guadagni.
 - `POST /api/earnings/redeem` — `{ investmentId?, quotes? }`; riscatta solo il profitto corrente sopra il capitale iniziale vincolato. Con `investmentId` opera sul singolo contratto; senza ID riscatta tutti i profitti disponibili. Registra una voce atomica per ogni investimento interessato, includendo `investmentId` e `planName`.
 - `POST /api/investments` — `{ amount, planId, quotes? }`; il server verifica il saldo deposito e stabilisce importo, piano, data iniziale, scadenza fissa e snapshot delle percentuali `allocation` e dei prezzi correnti.
